@@ -50,142 +50,145 @@
 (async function(){
   const canvas = document.getElementById('canvas');
   const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer:true, stencil:true }, true);
-  let scene = new BABYLON.Scene(engine);
-  scene.useRightHandedSystem = true; // ARCore usa RHS
+  const scene  = new BABYLON.Scene(engine);
+  scene.useRightHandedSystem = true;
   scene.clearColor = new BABYLON.Color4(0,0,0,0);
 
-  // Luz ambiente leve
+  // Luz básica + material da caixa
   const hemi = new BABYLON.HemisphericLight("hemi", new BABYLON.Vector3(0,1,0), scene); hemi.intensity = 0.6;
+  const boxMat = new BABYLON.StandardMaterial("boxMat", scene); boxMat.alpha = 0.35; boxMat.diffuseColor = new BABYLON.Color3(0.2,0.9,0.6);
 
-  // Material semitransparente da caixa (cor vai mudar conforme limites)
-  const boxMat = new BABYLON.StandardMaterial("boxMat", scene);
-  boxMat.alpha = 0.35; // semitransparente
-  boxMat.diffuseColor = new BABYLON.Color3(0.2, 0.9, 0.6); // verde default
-
-  // Caixa "unitária": criamos 1x1x1 e escalamos conforme cm->m
-  const box = BABYLON.MeshBuilder.CreateBox("box", { size: 1 }, scene);
-  box.isVisible = false;
-  box.material = boxMat;
-
-  // Retículo para feedback de hit test
+  // Caixa e retículo
+  const box = BABYLON.MeshBuilder.CreateBox("box", { size: 1 }, scene); box.isVisible = false; box.material = boxMat;
   const reticle = BABYLON.MeshBuilder.CreateTorus("reticle", { diameter:0.2, thickness:0.003, tessellation:64 }, scene);
-  reticle.isVisible = false;
-  const retMat = new BABYLON.StandardMaterial("retMat", scene);
-  retMat.emissiveColor = new BABYLON.Color3(1, 0.9, 0.2);
-  reticle.material = retMat;
+  const retMat = new BABYLON.StandardMaterial("retMat", scene); retMat.emissiveColor = new BABYLON.Color3(1,0.9,0.2);
+  reticle.material = retMat; reticle.isVisible = false;
 
   const camera = new BABYLON.FreeCamera("cam", new BABYLON.Vector3(0,1.6,0), scene);
 
-  // UI refs
+  // UI
   const $ = (id)=>document.getElementById(id);
-  const inW = $("inW"), inH = $("inH"), inD = $("inD");
-  const maxW = $("maxW"), maxH = $("maxH"), maxD = $("maxD");
-  const startBtn = $("start"), placeBtn = $("place"), snapBtn = $("snap");
-  const msg = $("msg");
+  const inW=$("inW"), inH=$("inH"), inD=$("inD"), maxW=$("maxW"), maxH=$("maxH"), maxD=$("maxD");
+  const startBtn=$("start"), placeBtn=$("place"), snapBtn=$("snap"), msg=$("msg");
 
-  let xrHelper, xr; let currentAnchor = null; let lastHitPose = null;
+  let xrHelper, xr; let lastHitPose = null; let currentAnchor = null; let hitsCount = 0;
 
-  function setBoxSizeFromInputs(){
-    // cm -> m
-    const w = Math.max(1, Number(inW.value||0)) / 100.0;
-    const h = Math.max(1, Number(inH.value||0)) / 100.0;
-    const d = Math.max(1, Number(inD.value||0)) / 100.0;
+  function setStatus(t){ msg.textContent = `${t} | hits: ${hitsCount}`; }
 
-    // limita cor por limites (cm)
-    const fits = (Number(inW.value) <= Number(maxW.value))
-              && (Number(inH.value) <= Number(maxH.value))
-              && (Number(inD.value) <= Number(maxD.value));
+  function setBoxFromInputs(){
+    const w = Math.max(1, Number(inW.value||0))/100.0;
+    const h = Math.max(1, Number(inH.value||0))/100.0;
+    const d = Math.max(1, Number(inD.value||0))/100.0;
+    const fits = (Number(inW.value)<=Number(maxW.value))&&(Number(inH.value)<=Number(maxH.value))&&(Number(inD.value)<=Number(maxD.value));
+    boxMat.diffuseColor = fits ? new BABYLON.Color3(0.2,0.9,0.6) : new BABYLON.Color3(0.95,0.25,0.25);
+    box.scaling.set(w,h,d);
+    box.position.y = h/2.0; // apoia no piso
+  }
+  setBoxFromInputs();
+  [inW,inH,inD,maxW,maxH,maxD].forEach(e=>e.addEventListener('input', setBoxFromInputs));
 
-    // cor: verde (ok) / vermelha (fora)
-    boxMat.diffuseColor = fits ? new BABYLON.Color3(0.2, 0.9, 0.6)
-                               : new BABYLON.Color3(0.95, 0.25, 0.25);
+  // === NOVO: sessão XR com features ajustadas ===
+  async function startXR(){
+    xrHelper = await scene.createDefaultXRExperienceAsync({
+      uiOptions: { sessionMode: "immersive-ar" },
+      optionalFeatures: true
+    });
 
-    // o box padrão é centrado no pivot; para “encostar no piso”, elevamos metade da altura
-    box.scaling.set(w, h, d);
-    box.position.y = h / 2.0;
+    // Entra em AR especificando recursos
+    await xrHelper.baseExperience.enterXRAsync("immersive-ar", "unbounded", xrHelper.renderTarget, {
+      requiredFeatures: ["hit-test"],
+      optionalFeatures: ["local-floor","anchors","light-estimation"] // tenta local-floor
+    });
+
+    const fm = xrHelper.baseExperience.featuresManager;
+    // Light estimation (opcional)
+    fm.enableFeature(BABYLON.WebXRFeatureName.LIGHT_ESTIMATION, "latest");
+
+    // HIT TEST contínuo (viewer space)
+    const hitTest = fm.enableFeature(BABYLON.WebXRFeatureName.HIT_TEST, "latest", {
+      entityTypes: ["plane","point"]
+    });
+
+    // Âncoras (opcional)
+    const anchors = fm.enableFeature(BABYLON.WebXRFeatureName.ANCHOR_SYSTEM, "latest");
+
+    setStatus("AR iniciado — procurando piso...");
+
+    hitTest.onHitTestResultObservable.add((results)=>{
+      hitsCount = results?.length || 0;
+      if (!results || results.length===0){
+        reticle.isVisible = false; lastHitPose = null; setStatus("Movimente o celular para varrer o piso...");
+        return;
+      }
+      const hit = results[0];
+      reticle.isVisible = true;
+      reticle.position.copyFrom(hit.position);
+      reticle.rotationQuaternion = hit.rotationQuaternion;
+      lastHitPose = { position: hit.position.clone(), rotationQuaternion: hit.rotationQuaternion.clone() };
+      setStatus("Piso detectado");
+    });
+
+    // === NOVO: fallback por toque (transient hit-test) ===
+    scene.onPointerDown = async () => {
+      try {
+        const transient = fm.enableFeature(BABYLON.WebXRFeatureName.HIT_TEST, "latest", { transientHitTest:true });
+        const tHits = transient.getHitTestResults?.() || [];
+        if (tHits.length>0){
+          const hit = tHits[0];
+          lastHitPose = { position: hit.position.clone(), rotationQuaternion: hit.rotationQuaternion.clone() };
+          reticle.isVisible = true;
+          reticle.position.copyFrom(hit.position);
+          reticle.rotationQuaternion = hit.rotationQuaternion;
+          setStatus("Hit por toque");
+        }
+      } catch(_) {}
+    };
+
+    // Expõe helpers para “place”
+    return { anchors };
   }
 
-  setBoxSizeFromInputs();
-  [inW,inH,inD,maxW,maxH,maxD].forEach(el => el.addEventListener('input', setBoxSizeFromInputs));
+  let anchorsFeature = null;
 
-  startBtn.onclick = async () => {
+  startBtn.onclick = async ()=>{
     try {
-      xrHelper = await scene.createDefaultXRExperienceAsync({
-        uiOptions: { sessionMode: "immersive-ar" }, // AR no Chrome Android
-      });
-      xr = xrHelper.baseExperience;
-      await xr.enterXRAsync("immersive-ar", "unbounded", xrHelper.renderTarget);
-
-      // Habilita features: Hit Test + Âncoras + Light Estimation (quando disponível)
-      const fm = xr.featuresManager;
-      const hitTest = fm.enableFeature(BABYLON.WebXRFeatureName.HIT_TEST, "latest");
-      const anchors = fm.enableFeature(BABYLON.WebXRFeatureName.ANCHOR_SYSTEM, "latest");
-      fm.enableFeature(BABYLON.WebXRFeatureName.LIGHT_ESTIMATION, "latest");
-
-      // Atualiza retículo conforme hit test
-      hitTest.onHitTestResultObservable.add((results) => {
-        if (!results || results.length === 0) {
-          reticle.isVisible = false; lastHitPose = null; return;
-        }
-        const hit = results[0];
-        reticle.isVisible = true;
-        reticle.position.copyFrom(hit.position);
-        reticle.rotationQuaternion = hit.rotationQuaternion;
-        lastHitPose = { position: hit.position.clone(), rotationQuaternion: hit.rotationQuaternion.clone() };
-      });
-
-      msg.textContent = "Mova o celular para detectar o piso; quando o retículo aparecer, toque em 'Colocar no piso'.";
-    } catch(e) {
-      console.error(e);
-      msg.textContent = "Seu navegador/dispositivo não suportou WebXR AR aqui.";
-    }
-  };
-
-  placeBtn.onclick = async () => {
-    if (!xr || !lastHitPose) { msg.textContent = "Aponte para o piso até o retículo aparecer."; return; }
-
-    // Remove âncora anterior
-    if (currentAnchor) { currentAnchor.detach(); currentAnchor = null; }
-
-    setBoxSizeFromInputs();
-    box.isVisible = true;
-
-    // Cria âncora na pose detectada
-    const fm = xr.featuresManager;
-    const anchors = fm.getEnabledFeatures().find(f => f.name === BABYLON.WebXRFeatureName.ANCHOR_SYSTEM);
-    if (anchors) {
-      const anchor = await anchors.addAnchorAtPositionAndRotation(
-        lastHitPose.position,
-        lastHitPose.rotationQuaternion
-      );
-      if (anchor) {
-        currentAnchor = anchor;
-        // “Solda” a caixa ao mundo via âncora
-        anchor.attachedNode = box;
-        msg.textContent = "Caixa posicionada. Ajuste medidas ou tire uma foto.";
-      } else {
-        // fallback: sem âncora, só posiciona no hit atual
-        box.position.copyFrom(lastHitPose.position);
-        box.rotationQuaternion = lastHitPose.rotationQuaternion.clone();
-      }
-    }
-  };
-
-  snapBtn.onclick = () => {
-    try {
-      // Captura simples do canvas (não é “foto AR nativa”, mas útil para MVP)
-      const data = canvas.toDataURL("image/png");
-      const a = document.createElement('a');
-      a.href = data; a.download = `boxfit_ar_${Date.now()}.png`; a.click();
+      const r = await startXR();
+      anchorsFeature = r.anchors;
     } catch(e){
-      console.warn(e);
-      msg.textContent = "Não foi possível capturar a imagem neste navegador.";
+      console.error(e); setStatus("Falha ao iniciar AR. Verifique HTTPS/Permissão de câmera/Chrome atualizado.");
     }
   };
 
-  engine.runRenderLoop(() => scene.render());
-  window.addEventListener('resize', () => engine.resize());
+  placeBtn.onclick = async ()=>{
+    if (!lastHitPose){ setStatus("Aponte para o piso até aparecer o retículo (ou toque uma vez na tela)."); return; }
+    if (currentAnchor){ currentAnchor.detach(); currentAnchor = null; }
+    setBoxFromInputs(); box.isVisible = true;
+
+    // Tenta ancorar (opcional)
+    if (anchorsFeature){
+      try {
+        const a = await anchorsFeature.addAnchorAtPositionAndRotation(lastHitPose.position, lastHitPose.rotationQuaternion);
+        if (a){ currentAnchor = a; a.attachedNode = box; setStatus("Caixa ancorada"); return; }
+      } catch(_) {}
+    }
+    // Fallback sem âncora
+    box.position.copyFrom(lastHitPose.position);
+    box.rotationQuaternion = lastHitPose.rotationQuaternion.clone();
+    setStatus("Caixa posicionada (sem âncora)");
+  };
+
+  snapBtn.onclick = ()=>{
+    try{
+      const data = canvas.toDataURL("image/png");
+      const a = document.createElement('a'); a.href=data; a.download=`boxfit_ar_${Date.now()}.png`; a.click();
+      setStatus("Imagem salva");
+    }catch(_){ setStatus("Não foi possível capturar a imagem."); }
+  };
+
+  engine.runRenderLoop(()=>scene.render());
+  addEventListener('resize', ()=>engine.resize());
 })();
 </script>
 </body>
+
 </html>
