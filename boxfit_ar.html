@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>BoxFit AR (WebXR MVP)</title>
+  <!-- Babylon.js CDN -->
+  <script src="https://cdn.babylonjs.com/babylon.js"></script>
+  <script src="https://cdn.babylonjs.com/gui/babylon.gui.min.js"></script>
+  <style>
+    html, body { width:100%; height:100%; margin:0; overflow:hidden; background:#111; }
+    #ui {
+      position: fixed; left: 8px; right: 8px; bottom: 8px;
+      background: rgba(0,0,0,.55); color:#fff; backdrop-filter: blur(6px);
+      border-radius: 12px; padding: 10px; font-family: system-ui, sans-serif;
+    }
+    #ui label { font-size: 12px; opacity:.9; }
+    #ui input { width: 70px; padding:6px; margin-right:8px; border-radius:8px; border:1px solid #444; background:#222; color:#fff; }
+    #ui button {
+      padding:8px 12px; margin-right:6px; border-radius:10px; border:0; color:#111; font-weight:600; cursor:pointer;
+    }
+    #start { background:#ffd54f; }
+    #place { background:#64ffda; }
+    #snap  { background:#90caf9; }
+    #msg   { font-size:12px; margin-top:6px; opacity:.9; }
+    #canvas { width:100%; height:100%; touch-action:none; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+
+  <div id="ui">
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;">
+      <label>L(cm)</label><input id="inW" type="number" min="1" value="55">
+      <label>A(cm)</label><input id="inH" type="number" min="1" value="35">
+      <label>P(cm)</label><input id="inD" type="number" min="1" value="25">
+      <label>Limite L</label><input id="maxW" type="number" min="1" value="55">
+      <label>Limite A</label><input id="maxH" type="number" min="1" value="35">
+      <label>Limite P</label><input id="maxD" type="number" min="1" value="25">
+    </div>
+    <div style="margin-top:8px;">
+      <button id="start">Iniciar AR</button>
+      <button id="place">Colocar no piso</button>
+      <button id="snap">Foto</button>
+    </div>
+    <div id="msg">Dica: mova o celular para o Chrome encontrar o piso (retículo aparece).</div>
+  </div>
+
+<script>
+(async function(){
+  const canvas = document.getElementById('canvas');
+  const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer:true, stencil:true }, true);
+  let scene = new BABYLON.Scene(engine);
+  scene.useRightHandedSystem = true; // ARCore usa RHS
+  scene.clearColor = new BABYLON.Color4(0,0,0,0);
+
+  // Luz ambiente leve
+  const hemi = new BABYLON.HemisphericLight("hemi", new BABYLON.Vector3(0,1,0), scene); hemi.intensity = 0.6;
+
+  // Material semitransparente da caixa (cor vai mudar conforme limites)
+  const boxMat = new BABYLON.StandardMaterial("boxMat", scene);
+  boxMat.alpha = 0.35; // semitransparente
+  boxMat.diffuseColor = new BABYLON.Color3(0.2, 0.9, 0.6); // verde default
+
+  // Caixa "unitária": criamos 1x1x1 e escalamos conforme cm->m
+  const box = BABYLON.MeshBuilder.CreateBox("box", { size: 1 }, scene);
+  box.isVisible = false;
+  box.material = boxMat;
+
+  // Retículo para feedback de hit test
+  const reticle = BABYLON.MeshBuilder.CreateTorus("reticle", { diameter:0.2, thickness:0.003, tessellation:64 }, scene);
+  reticle.isVisible = false;
+  const retMat = new BABYLON.StandardMaterial("retMat", scene);
+  retMat.emissiveColor = new BABYLON.Color3(1, 0.9, 0.2);
+  reticle.material = retMat;
+
+  const camera = new BABYLON.FreeCamera("cam", new BABYLON.Vector3(0,1.6,0), scene);
+
+  // UI refs
+  const $ = (id)=>document.getElementById(id);
+  const inW = $("inW"), inH = $("inH"), inD = $("inD");
+  const maxW = $("maxW"), maxH = $("maxH"), maxD = $("maxD");
+  const startBtn = $("start"), placeBtn = $("place"), snapBtn = $("snap");
+  const msg = $("msg");
+
+  let xrHelper, xr; let currentAnchor = null; let lastHitPose = null;
+
+  function setBoxSizeFromInputs(){
+    // cm -> m
+    const w = Math.max(1, Number(inW.value||0)) / 100.0;
+    const h = Math.max(1, Number(inH.value||0)) / 100.0;
+    const d = Math.max(1, Number(inD.value||0)) / 100.0;
+
+    // limita cor por limites (cm)
+    const fits = (Number(inW.value) <= Number(maxW.value))
+              && (Number(inH.value) <= Number(maxH.value))
+              && (Number(inD.value) <= Number(maxD.value));
+
+    // cor: verde (ok) / vermelha (fora)
+    boxMat.diffuseColor = fits ? new BABYLON.Color3(0.2, 0.9, 0.6)
+                               : new BABYLON.Color3(0.95, 0.25, 0.25);
+
+    // o box padrão é centrado no pivot; para “encostar no piso”, elevamos metade da altura
+    box.scaling.set(w, h, d);
+    box.position.y = h / 2.0;
+  }
+
+  setBoxSizeFromInputs();
+  [inW,inH,inD,maxW,maxH,maxD].forEach(el => el.addEventListener('input', setBoxSizeFromInputs));
+
+  startBtn.onclick = async () => {
+    try {
+      xrHelper = await scene.createDefaultXRExperienceAsync({
+        uiOptions: { sessionMode: "immersive-ar" }, // AR no Chrome Android
+      });
+      xr = xrHelper.baseExperience;
+      await xr.enterXRAsync("immersive-ar", "unbounded", xrHelper.renderTarget);
+
+      // Habilita features: Hit Test + Âncoras + Light Estimation (quando disponível)
+      const fm = xr.featuresManager;
+      const hitTest = fm.enableFeature(BABYLON.WebXRFeatureName.HIT_TEST, "latest");
+      const anchors = fm.enableFeature(BABYLON.WebXRFeatureName.ANCHOR_SYSTEM, "latest");
+      fm.enableFeature(BABYLON.WebXRFeatureName.LIGHT_ESTIMATION, "latest");
+
+      // Atualiza retículo conforme hit test
+      hitTest.onHitTestResultObservable.add((results) => {
+        if (!results || results.length === 0) {
+          reticle.isVisible = false; lastHitPose = null; return;
+        }
+        const hit = results[0];
+        reticle.isVisible = true;
+        reticle.position.copyFrom(hit.position);
+        reticle.rotationQuaternion = hit.rotationQuaternion;
+        lastHitPose = { position: hit.position.clone(), rotationQuaternion: hit.rotationQuaternion.clone() };
+      });
+
+      msg.textContent = "Mova o celular para detectar o piso; quando o retículo aparecer, toque em 'Colocar no piso'.";
+    } catch(e) {
+      console.error(e);
+      msg.textContent = "Seu navegador/dispositivo não suportou WebXR AR aqui.";
+    }
+  };
+
+  placeBtn.onclick = async () => {
+    if (!xr || !lastHitPose) { msg.textContent = "Aponte para o piso até o retículo aparecer."; return; }
+
+    // Remove âncora anterior
+    if (currentAnchor) { currentAnchor.detach(); currentAnchor = null; }
+
+    setBoxSizeFromInputs();
+    box.isVisible = true;
+
+    // Cria âncora na pose detectada
+    const fm = xr.featuresManager;
+    const anchors = fm.getEnabledFeatures().find(f => f.name === BABYLON.WebXRFeatureName.ANCHOR_SYSTEM);
+    if (anchors) {
+      const anchor = await anchors.addAnchorAtPositionAndRotation(
+        lastHitPose.position,
+        lastHitPose.rotationQuaternion
+      );
+      if (anchor) {
+        currentAnchor = anchor;
+        // “Solda” a caixa ao mundo via âncora
+        anchor.attachedNode = box;
+        msg.textContent = "Caixa posicionada. Ajuste medidas ou tire uma foto.";
+      } else {
+        // fallback: sem âncora, só posiciona no hit atual
+        box.position.copyFrom(lastHitPose.position);
+        box.rotationQuaternion = lastHitPose.rotationQuaternion.clone();
+      }
+    }
+  };
+
+  snapBtn.onclick = () => {
+    try {
+      // Captura simples do canvas (não é “foto AR nativa”, mas útil para MVP)
+      const data = canvas.toDataURL("image/png");
+      const a = document.createElement('a');
+      a.href = data; a.download = `boxfit_ar_${Date.now()}.png`; a.click();
+    } catch(e){
+      console.warn(e);
+      msg.textContent = "Não foi possível capturar a imagem neste navegador.";
+    }
+  };
+
+  engine.runRenderLoop(() => scene.render());
+  window.addEventListener('resize', () => engine.resize());
+})();
+</script>
+</body>
+</html>
