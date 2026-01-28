@@ -3,47 +3,66 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>BoxFit AR (WebXR MVP)</title>
-  <!-- Babylon.js CDN -->
+  <title>BoxFit AR (WebXR)</title>
+  <!-- Babylon + GUI + GridMaterial -->
   <script src="https://cdn.babylonjs.com/babylon.js"></script>
   <script src="https://cdn.babylonjs.com/gui/babylon.gui.min.js"></script>
+  <script src="https://cdn.babylonjs.com/materialsLibrary/babylon.gridMaterial.min.js"></script>
   <style>
-    html, body { width:100%; height:100%; margin:0; overflow:hidden; background:#111; }
+    :root {
+      --ui-bg: rgba(0,0,0,.50);
+      --ui-fg: #fff;
+      --accent1: #ffd54f;
+      --accent2: #64ffda;
+      --accent3: #90caf9;
+    }
+    * { box-sizing:border-box; }
+    html, body { width:100%; height:100%; margin:0; background:#111; }
+    #canvas { width:100%; height:100%; touch-action:none; display:block; }
     #ui {
       position: fixed; left: 8px; right: 8px; bottom: 8px;
-      background: rgba(0,0,0,.55); color:#fff; backdrop-filter: blur(6px);
-      border-radius: 12px; padding: 10px; font-family: system-ui, sans-serif;
+      padding: 10px; border-radius: 12px; color: var(--ui-fg);
+      background: var(--ui-bg); backdrop-filter: blur(6px);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
     }
-    #ui label { font-size: 12px; opacity:.9; }
-    #ui input { width: 70px; padding:6px; margin-right:8px; border-radius:8px; border:1px solid #444; background:#222; color:#fff; }
-    #ui button {
-      padding:8px 12px; margin-right:6px; border-radius:10px; border:0; color:#111; font-weight:600; cursor:pointer;
+    .row { display:flex; align-items:center; gap:6px; flex-wrap:nowrap; }
+    .row input {
+      flex: 1 1 0; min-width: 0;
+      /* largura proporcional: tente caber numa linha em telas ~360–440px */
+      width: 22vw; max-width: 120px;
+      padding: 6px 8px; border-radius: 10px; border:1px solid #444;
+      background:#222; color:#fff; font-size: 12px;
     }
-    #start { background:#ffd54f; }
-    #place { background:#64ffda; }
-    #snap  { background:#90caf9; }
-    #msg   { font-size:12px; margin-top:6px; opacity:.9; }
-    #canvas { width:100%; height:100%; touch-action:none; }
+    .row button {
+      padding: 8px 12px; border-radius: 10px; border:0; font-weight:600; cursor:pointer;
+      color:#111;
+    }
+    #start { background: var(--accent1); }
+    #place { background: var(--accent2); }
+    #snap  { background: var(--accent3); }
+    #msg { margin-top:6px; font-size:12px; opacity:.9; }
+    @media (max-width: 360px) {
+      /* fallback: se realmente não couber, permite quebrar linha */
+      .row { flex-wrap: wrap; }
+    }
   </style>
 </head>
 <body>
   <canvas id="canvas"></canvas>
 
   <div id="ui">
-    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;">
-      <label>L(cm)</label><input id="inW" type="number" min="1" value="55">
-      <label>A(cm)</label><input id="inH" type="number" min="1" value="35">
-      <label>P(cm)</label><input id="inD" type="number" min="1" value="25">
-      <label>Limite L</label><input id="maxW" type="number" min="1" value="55">
-      <label>Limite A</label><input id="maxH" type="number" min="1" value="35">
-      <label>Limite P</label><input id="maxD" type="number" min="1" value="25">
+    <div class="row" id="fields">
+      <!-- Apenas LIMITES (placeholders no lugar de labels) -->
+      <input id="maxW" type="number" min="1" value="55" placeholder="Limite L (cm)">
+      <input id="maxH" type="number" min="1" value="35" placeholder="Limite A (cm)">
+      <input id="maxD" type="number" min="1" value="25" placeholder="Limite P (cm)">
     </div>
-    <div style="margin-top:8px;">
+    <div class="row" style="margin-top:8px;">
       <button id="start">Iniciar AR</button>
-      <button id="place">Colocar no piso</button>
+      <button id="place">Posicionar caixa</button>
       <button id="snap">Foto</button>
     </div>
-    <div id="msg">Dica: mova o celular para o Chrome encontrar o piso (retículo aparece).</div>
+    <div id="msg">Toque em “Iniciar AR”, mova o celular para “varrer” o piso e aguarde a grade aparecer.</div>
   </div>
 
 <script>
@@ -54,141 +73,167 @@
   scene.useRightHandedSystem = true;
   scene.clearColor = new BABYLON.Color4(0,0,0,0);
 
-  // Luz básica + material da caixa
-  const hemi = new BABYLON.HemisphericLight("hemi", new BABYLON.Vector3(0,1,0), scene); hemi.intensity = 0.6;
-  const boxMat = new BABYLON.StandardMaterial("boxMat", scene); boxMat.alpha = 0.35; boxMat.diffuseColor = new BABYLON.Color3(0.2,0.9,0.6);
+  const hemi = new BABYLON.HemisphericLight("hemi", new BABYLON.Vector3(0,1,0), scene);
+  hemi.intensity = 0.6;
 
-  // Caixa e retículo
-  const box = BABYLON.MeshBuilder.CreateBox("box", { size: 1 }, scene); box.isVisible = false; box.material = boxMat;
-  const reticle = BABYLON.MeshBuilder.CreateTorus("reticle", { diameter:0.2, thickness:0.003, tessellation:64 }, scene);
-  const retMat = new BABYLON.StandardMaterial("retMat", scene); retMat.emissiveColor = new BABYLON.Color3(1,0.9,0.2);
-  reticle.material = retMat; reticle.isVisible = false;
+  // Caixa = "gabarito" (limites) — sem cores de "aprovação/reprovação"
+  const boxMat = new BABYLON.StandardMaterial("boxMat", scene);
+  boxMat.alpha = 0.35;
+  boxMat.diffuseColor = new BABYLON.Color3(0.2, 0.8, 0.9); // ciano suave
 
-  const camera = new BABYLON.FreeCamera("cam", new BABYLON.Vector3(0,1.6,0), scene);
+  const box = BABYLON.MeshBuilder.CreateBox("box", { size: 1 }, scene);
+  box.isVisible = false;
+  box.material = boxMat;
 
-  // UI
+  // Grade no chão (alinhada ao hit); células de 10 cm
+  const grid = BABYLON.MeshBuilder.CreateGround("grid", { width: 1.2, height: 1.2, subdivisions: 2 }, scene);
+  const gridMat = new BABYLON.GridMaterial("gridMat", scene);
+  gridMat.gridRatio = 0.1;           // 0.1 m = 10 cm por célula
+  gridMat.mainColor = new BABYLON.Color3(0.8, 0.8, 0.8);
+  gridMat.lineColor = new BABYLON.Color3(0.35, 0.35, 0.35);
+  gridMat.opacity = 0.6;
+  grid.material = gridMat;
+  grid.isVisible = false;
+
   const $ = (id)=>document.getElementById(id);
-  const inW=$("inW"), inH=$("inH"), inD=$("inD"), maxW=$("maxW"), maxH=$("maxH"), maxD=$("maxD");
+  const maxW=$("maxW"), maxH=$("maxH"), maxD=$("maxD");
   const startBtn=$("start"), placeBtn=$("place"), snapBtn=$("snap"), msg=$("msg");
 
-  let xrHelper, xr; let lastHitPose = null; let currentAnchor = null; let hitsCount = 0;
+  let xrHelper=null, xr=null;
+  let lastHitPose=null, currentAnchor=null;
+  let hitsCount=0;
 
   function setStatus(t){ msg.textContent = `${t} | hits: ${hitsCount}`; }
 
-  function setBoxFromInputs(){
-    const w = Math.max(1, Number(inW.value||0))/100.0;
-    const h = Math.max(1, Number(inH.value||0))/100.0;
-    const d = Math.max(1, Number(inD.value||0))/100.0;
-    const fits = (Number(inW.value)<=Number(maxW.value))&&(Number(inH.value)<=Number(maxH.value))&&(Number(inD.value)<=Number(maxD.value));
-    boxMat.diffuseColor = fits ? new BABYLON.Color3(0.2,0.9,0.6) : new BABYLON.Color3(0.95,0.25,0.25);
-    box.scaling.set(w,h,d);
-    box.position.y = h/2.0; // apoia no piso
+  function setBoxFromLimits(){
+    const w = Math.max(1, Number(maxW.value||0)) / 100.0; // cm -> m
+    const h = Math.max(1, Number(maxH.value||0)) / 100.0;
+    const d = Math.max(1, Number(maxD.value||0)) / 100.0;
+    box.scaling.set(w, h, d);
+    box.position.y = h / 2.0; // "encosta" no chão
   }
-  setBoxFromInputs();
-  [inW,inH,inD,maxW,maxH,maxD].forEach(e=>e.addEventListener('input', setBoxFromInputs));
+  setBoxFromLimits();
+  [maxW,maxH,maxD].forEach(e=>e.addEventListener('input', setBoxFromLimits));
 
-  // === NOVO: sessão XR com features ajustadas ===
+  // === inicia sessão XR com hit-test (estável) e features opcionais ===
+  let hitTestFeature = null, anchorsFeature = null, transientFeature = null;
+
   async function startXR(){
+    if (xrHelper?.baseExperience?.isInXR) return; // evita reentrar
+
     xrHelper = await scene.createDefaultXRExperienceAsync({
       uiOptions: { sessionMode: "immersive-ar" },
       optionalFeatures: true
     });
 
-    // Entra em AR especificando recursos
     await xrHelper.baseExperience.enterXRAsync("immersive-ar", "unbounded", xrHelper.renderTarget, {
-      requiredFeatures: ["hit-test"],
-      optionalFeatures: ["local-floor","anchors","light-estimation"] // tenta local-floor
+      requiredFeatures: ["hit-test"], // base do posicionamento no WebXR/Chrome
+      optionalFeatures: ["local-floor", "anchors", "light-estimation"] // melhora alinhamento/realismo
     });
 
-    const fm = xrHelper.baseExperience.featuresManager;
-    // Light estimation (opcional)
-    fm.enableFeature(BABYLON.WebXRFeatureName.LIGHT_ESTIMATION, "latest");
+    xr = xrHelper.baseExperience;
+    const fm = xr.featuresManager;
 
-    // HIT TEST contínuo (viewer space)
-    const hitTest = fm.enableFeature(BABYLON.WebXRFeatureName.HIT_TEST, "latest", {
+    // Habilita uma única vez
+    hitTestFeature = fm.enableFeature(BABYLON.WebXRFeatureName.HIT_TEST, "latest", {
       entityTypes: ["plane","point"]
     });
+    anchorsFeature = fm.enableFeature(BABYLON.WebXRFeatureName.ANCHOR_SYSTEM, "latest");
+    fm.enableFeature(BABYLON.WebXRFeatureName.LIGHT_ESTIMATION, "latest");
 
-    // Âncoras (opcional)
-    const anchors = fm.enableFeature(BABYLON.WebXRFeatureName.ANCHOR_SYSTEM, "latest");
+    // Transient hit-test (fallback por toque) — instanciado UMA vez
+    transientFeature = fm.enableFeature(BABYLON.WebXRFeatureName.HIT_TEST, "latest", {
+      transientHitTest: true
+    });
 
-    setStatus("AR iniciado — procurando piso...");
-
-    hitTest.onHitTestResultObservable.add((results)=>{
+    // Atualiza grade/retículo com o hit contínuo
+    hitTestFeature.onHitTestResultObservable.add((results) => {
       hitsCount = results?.length || 0;
-      if (!results || results.length===0){
-        reticle.isVisible = false; lastHitPose = null; setStatus("Movimente o celular para varrer o piso...");
+      if (!results || results.length === 0) {
+        lastHitPose = null;
+        grid.isVisible = false;
+        setStatus("Procure textura/varra o piso...");
         return;
       }
       const hit = results[0];
-      reticle.isVisible = true;
-      reticle.position.copyFrom(hit.position);
-      reticle.rotationQuaternion = hit.rotationQuaternion;
-      lastHitPose = { position: hit.position.clone(), rotationQuaternion: hit.rotationQuaternion.clone() };
+      lastHitPose = {
+        position: hit.position.clone(),
+        rotationQuaternion: hit.rotationQuaternion.clone()
+      };
+      // Grade aparece alinhada ao piso
+      grid.position.copyFrom(hit.position);
+      grid.rotationQuaternion = hit.rotationQuaternion;
+      grid.isVisible = true;
       setStatus("Piso detectado");
     });
 
-    // === NOVO: fallback por toque (transient hit-test) ===
-    scene.onPointerDown = async () => {
+    // Fallback: um toque força um hit transiente
+    scene.onPointerDown = () => {
       try {
-        const transient = fm.enableFeature(BABYLON.WebXRFeatureName.HIT_TEST, "latest", { transientHitTest:true });
-        const tHits = transient.getHitTestResults?.() || [];
-        if (tHits.length>0){
+        const tHits = transientFeature.getHitTestResults?.() || [];
+        if (tHits.length > 0) {
           const hit = tHits[0];
-          lastHitPose = { position: hit.position.clone(), rotationQuaternion: hit.rotationQuaternion.clone() };
-          reticle.isVisible = true;
-          reticle.position.copyFrom(hit.position);
-          reticle.rotationQuaternion = hit.rotationQuaternion;
+          lastHitPose = {
+            position: hit.position.clone(),
+            rotationQuaternion: hit.rotationQuaternion.clone()
+          };
+          grid.position.copyFrom(hit.position);
+          grid.rotationQuaternion = hit.rotationQuaternion;
+          grid.isVisible = true;
           setStatus("Hit por toque");
         }
-      } catch(_) {}
+      } catch(e) { /* silencioso */ }
     };
 
-    // Expõe helpers para “place”
-    return { anchors };
+    setStatus("AR iniciado — varra o piso até a grade aparecer");
   }
 
-  let anchorsFeature = null;
+  startBtn.onclick = async () => {
+    try { await startXR(); }
+    catch(e){ console.error(e); setStatus("Falha ao iniciar AR. Verifique HTTPS/perm. de câmera/Chrome."); }
+  };
 
-  startBtn.onclick = async ()=>{
+  placeBtn.onclick = async () => {
+    if (!xr || !lastHitPose) { setStatus("Aponte/toque no piso até a grade aparecer."); return; }
     try {
-      const r = await startXR();
-      anchorsFeature = r.anchors;
-    } catch(e){
-      console.error(e); setStatus("Falha ao iniciar AR. Verifique HTTPS/Permissão de câmera/Chrome atualizado.");
+      // remove âncora anterior
+      if (currentAnchor) { currentAnchor.detach(); currentAnchor = null; }
+
+      setBoxFromLimits();
+      box.isVisible = true;
+
+      if (anchorsFeature) {
+        const a = await anchorsFeature.addAnchorAtPositionAndRotation(
+          lastHitPose.position, lastHitPose.rotationQuaternion
+        );
+        if (a) {
+          currentAnchor = a;
+          a.attachedNode = box;
+          setStatus("Caixa ancorada");
+          return;
+        }
+      }
+      // fallback sem âncora
+      box.position.copyFrom(lastHitPose.position);
+      box.rotationQuaternion = lastHitPose.rotationQuaternion.clone();
+      setStatus("Caixa posicionada (sem âncora)");
+    } catch (e) {
+      console.error(e);
+      setStatus("Não foi possível posicionar. Tente novamente.");
     }
   };
 
-  placeBtn.onclick = async ()=>{
-    if (!lastHitPose){ setStatus("Aponte para o piso até aparecer o retículo (ou toque uma vez na tela)."); return; }
-    if (currentAnchor){ currentAnchor.detach(); currentAnchor = null; }
-    setBoxFromInputs(); box.isVisible = true;
-
-    // Tenta ancorar (opcional)
-    if (anchorsFeature){
-      try {
-        const a = await anchorsFeature.addAnchorAtPositionAndRotation(lastHitPose.position, lastHitPose.rotationQuaternion);
-        if (a){ currentAnchor = a; a.attachedNode = box; setStatus("Caixa ancorada"); return; }
-      } catch(_) {}
-    }
-    // Fallback sem âncora
-    box.position.copyFrom(lastHitPose.position);
-    box.rotationQuaternion = lastHitPose.rotationQuaternion.clone();
-    setStatus("Caixa posicionada (sem âncora)");
-  };
-
-  snapBtn.onclick = ()=>{
-    try{
+  snapBtn.onclick = () => {
+    try {
       const data = canvas.toDataURL("image/png");
-      const a = document.createElement('a'); a.href=data; a.download=`boxfit_ar_${Date.now()}.png`; a.click();
+      const a = document.createElement('a'); a.href = data; a.download = `boxfit_ar_${Date.now()}.png`; a.click();
       setStatus("Imagem salva");
-    }catch(_){ setStatus("Não foi possível capturar a imagem."); }
+    } catch (e) { setStatus("Falha ao capturar imagem."); }
   };
 
   engine.runRenderLoop(()=>scene.render());
-  addEventListener('resize', ()=>engine.resize());
+  window.addEventListener('resize', ()=>engine.resize());
 })();
 </script>
 </body>
-
 </html>
